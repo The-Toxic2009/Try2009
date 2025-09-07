@@ -1,0 +1,109 @@
+name: RDP-with-GoogleDrive
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp-with-drive:
+    runs-on: windows-latest
+    timeout-minutes: 360  # Max for GitHub Actions free runners
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          try { netsh advfirewall firewall delete rule name="RDP-Tailscale" } catch {}
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Write-Host "✅ RDP configured"
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          $username = "RDP"
+          $password = "MyStrongPassword123!"   # <-- CHANGE THIS TO YOUR SECURE PASSWORD
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member $username
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+              Write-Host "✅ RDP user created"
+          } else {
+              Set-LocalUser -Name $username -Password $securePass
+              Write-Host "✅ RDP user password updated"
+          }
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Chocolatey
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          Write-Host "✅ Chocolatey installed"
+
+      - name: Install Tailscale and rclone
+        run: |
+          choco install tailscale -y
+          choco install rclone -y
+          Write-Host "✅ Tailscale and rclone installed"
+
+      - name: Start Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY) { Write-Error "No TAILSCALE_AUTH_KEY"; exit 1 }
+          & tailscale up --authkey=$env:TAILSCALE_AUTH_KEY --hostname="gh-rdp-${env:GITHUB_RUN_ID}" --accept-routes
+          $tsIP = ""
+          for ($i = 0; $i -lt 12; $i++) {
+              Start-Sleep -Seconds 5
+              $tsIP = & tailscale ip -4
+              if ($tsIP -and $tsIP.Trim() -ne "") { break }
+          }
+          if (-not $tsIP -or $tsIP.Trim() -eq "") { Write-Error "No Tailscale IP assigned"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale up: $tsIP"
+
+      - name: Configure rclone for Google Drive
+        env:
+          RCLONE_CONFIG_GDRIVE_TYPE: drive
+          RCLONE_CONFIG_GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          RCLONE_CONFIG_GDRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
+        run: |
+          if (-not $env:RCLONE_CONFIG_GDRIVE_CLIENT_ID -or -not $env:RCLONE_CONFIG_GDRIVE_CLIENT_SECRET -or -not $env:RCLONE_CONFIG_GDRIVE_TOKEN) {
+              Write-Error "Google Drive credentials missing"
+              exit 1
+          }
+          Write-Host "✅ rclone config set"
+
+      - name: Mount Google Drive as D:
+        run: |
+          Start-Process -FilePath "rclone" -ArgumentList "mount gdrive: D: --vfs-cache-mode full --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off" -WindowStyle Hidden
+          for ($i = 0; $i -lt 10; $i++) {
+              Start-Sleep -Seconds 4
+              if (Test-Path "D:\") { Write-Host "✅ Google Drive mounted to D:\"; break }
+          }
+
+      - name: Status Info & Connection Details
+        run: |
+          Write-Host ""
+          Write-Host "🎯 RDP CONNECTION DETAILS:"
+          Write-Host "========================="
+          Write-Host "PC Name/IP: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "Drive: D: (Google Drive, 2TB)"
+          Write-Host ""
+          Write-Host "On Android: Use Microsoft Remote Desktop app, enter the above credentials & IP"
+          Write-Host "On Windows: Use mstsc or any RDP client, with the above credentials & IP"
+          Write-Host "========================="
+          Write-Host ""
+
+      - name: Keep Alive
+        run: |
+          Write-Host "RDP SESSION ACTIVE! (Ends after 6hr or workflow cancelled)"
+          while ($true) {
+              Start-Sleep -Seconds 300
+          }
