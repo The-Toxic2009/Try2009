@@ -10,6 +10,7 @@ jobs:
 
     steps:
       - name: Configure Core RDP Settings
+        shell: pwsh
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
@@ -20,9 +21,10 @@ jobs:
           Write-Host "✅ RDP configured"
 
       - name: Create RDP User with Fixed Password
+        shell: pwsh
         run: |
           $username = "RDP"
-          $password = "124421"  # Choose your secure password
+          $password = "124421"  # Replace with a secure password you prefer
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
@@ -34,6 +36,90 @@ jobs:
             Write-Host "✅ RDP user password updated"
           }
           echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Chocolatey
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          Write-Host "✅ Chocolatey installed"
+
+      - name: Install Tailscale and rclone
+        shell: pwsh
+        run: |
+          choco install tailscale -y
+          choco install rclone -y
+          Write-Host "✅ Tailscale and rclone installed"
+
+      - name: Start Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY) { Write-Error "No TAILSCALE_AUTH_KEY"; exit 1 }
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname="gh-rdp-${env:GITHUB_RUN_ID}"
+          $tsIP = ""
+          for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Seconds 5
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            if ($tsIP -and $tsIP.Trim() -ne "") { break }
+          }
+          if (-not $tsIP -or $tsIP.Trim() -eq "") { Write-Error "No Tailscale IP assigned"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale up: $tsIP"
+
+      - name: Setup rclone config for Google Drive
+        shell: pwsh
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
+        run: |
+          $rcloneDir = "$env:USERPROFILE\.config\rclone"
+          if (!(Test-Path $rcloneDir)) { New-Item -Type Directory -Path $rcloneDir -Force | Out-Null }
+          $config = @"
+[gdrive]
+type = drive
+client_id = $env:GOOGLE_CLIENT_ID
+client_secret = $env:GOOGLE_CLIENT_SECRET
+token = $env:GOOGLE_TOKEN
+"@
+          $rcloneConfigPath = "$rcloneDir\rclone.conf"
+          $config | Set-Content -Path $rcloneConfigPath -Encoding UTF8
+          Write-Host "✅ rclone config created"
+
+      - name: Mount Google Drive as D:
+        shell: pwsh
+        run: |
+          Start-Process -NoNewWindow -FilePath "rclone" -ArgumentList "mount gdrive: D: --config $env:USERPROFILE\.config\rclone\rclone.conf --vfs-cache-mode full --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off"
+          for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Seconds 4
+            if (Test-Path "D:\") { Write-Host "✅ Google Drive mounted to D:\"; break }
+          }
+
+      - name: Status Info & Connection Details
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "🎯 RDP CONNECTION DETAILS:"
+          Write-Host "========================="
+          Write-Host "PC Name/IP: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "Drive: D: (Google Drive, 2TB)"
+          Write-Host ""
+          Write-Host "On Android: Use Microsoft Remote Desktop app, enter the above credentials & IP"
+          Write-Host "On Windows: Use mstsc or any RDP client, with the above credentials & IP"
+          Write-Host "========================="
+          Write-Host ""
+
+      - name: Keep Alive
+        shell: pwsh
+        run: |
+          Write-Host "RDP SESSION ACTIVE! (Ends after 6hr or workflow cancelled)"
+          while ($true) { Start-Sleep -Seconds 300 }
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
       - name: Install Chocolatey
