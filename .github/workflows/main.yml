@@ -43,12 +43,12 @@ jobs:
           Set-ExecutionPolicy Bypass -Scope Process -Force
           iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
 
-      - name: Install Tailscale and rclone
+      - name: Install Tailscale and rclone with WinFsp
         shell: pwsh
         run: |
           choco install tailscale -y
           choco install rclone -y
-          choco install winfsp -y  # Required for Windows mounting
+          choco install winfsp -y
           Write-Host "✅ Tools installed"
 
       # Step 4: Start Tailscale
@@ -81,34 +81,38 @@ jobs:
           $configPath = "$configDir\rclone.conf"
           $configContent | Set-Content -Path $configPath -Encoding UTF8
           
-          # Test connection first
-          rclone ls gdrive: --max-items 5
+          # Test connection - CORRECTED COMMAND
+          rclone ls gdrive: --max-depth 1
           Write-Host "✅ rclone configured and tested"
 
-      # Step 6: Create persistent mount script
-      - name: Create mount script and service
+      # Step 6: Mount Google Drive persistently  
+      - name: Mount Google Drive as G drive
         shell: pwsh
         run: |
-          # Create mount script
+          # Create persistent mount script
           $mountScript = @"
-          @echo off
-          cd /d "C:\ProgramData\chocolatey\bin"
-          rclone mount gdrive: G: --config "$env:USERPROFILE\.config\rclone\rclone.conf" --vfs-cache-mode full --vfs-read-chunk-size 128M --network-mode --allow-other
-          "@
+rclone mount gdrive: G: --config "$env:USERPROFILE\.config\rclone\rclone.conf" --vfs-cache-mode full --vfs-read-chunk-size 128M --network-mode --allow-other --daemon
+"@
+          $mountScript | Set-Content -Path "C:\mount_gdrive.cmd" -Encoding ASCII
           
-          $mountScript | Set-Content -Path "C:\mount_gdrive.bat" -Encoding ASCII
+          # Execute mount
+          cmd /c "C:\mount_gdrive.cmd"
           
-          # Start mount in background
-          Start-Process -FilePath "C:\mount_gdrive.bat" -WindowStyle Hidden
-          
-          # Wait for mount
-          for ($i=0; $i -lt 15; $i++) {
+          # Wait and verify mount
+          for ($i=0; $i -lt 20; $i++) {
             Start-Sleep -Seconds 5
             if (Test-Path "G:\") { 
               Write-Host "✅ Google Drive mounted as G:\"
-              break 
+              # Test if it's actually our Google Drive by trying to list contents
+              try {
+                $testFiles = Get-ChildItem "G:\" -ErrorAction SilentlyContinue
+                Write-Host "✅ Google Drive contents accessible: $($testFiles.Count) items found"
+                break
+              } catch {
+                Write-Host "Mount exists but contents not accessible yet..."
+              }
             }
-            Write-Host "Waiting for mount... ($i/15)"
+            Write-Host "Waiting for mount... ($($i+1)/20)"
           }
 
       # Step 7: Display info
@@ -121,23 +125,24 @@ jobs:
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASS"
-          Write-Host "Google Drive: G:\ (2TB)"
+          Write-Host "Google Drive: G:\ (Your 2TB Drive)"
           Write-Host ""
           Write-Host "📱 Connect via Microsoft Remote Desktop"
           Write-Host "⏱️  Max runtime: 6 hours"
           Write-Host "========================="
 
       # Step 8: Keep alive with mount monitoring
-      - name: Keep alive and monitor mount
+      - name: Keep alive and monitor
         shell: pwsh
         run: |
-          Write-Host "🔄 Session active with Google Drive monitoring"
+          Write-Host "🔄 Session active with Google Drive mounted on G:\"
           while ($true) {
             Start-Sleep -Seconds 300
-            # Check if mount is still active
+            # Monitor mount health
             if (!(Test-Path "G:\")) {
-              Write-Host "⚠️ Mount lost, attempting to remount..."
-              Start-Process -FilePath "C:\mount_gdrive.bat" -WindowStyle Hidden
-              Start-Sleep -Seconds 30
+              Write-Host "⚠️ Mount lost, attempting remount..."
+              cmd /c "C:\mount_gdrive.cmd"
+            } else {
+              Write-Host "✅ Google Drive mount healthy"
             }
           }
