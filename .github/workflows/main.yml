@@ -1,43 +1,50 @@
 name: RDP-with-GoogleDrive
 
+# Workflow triggers manually via workflow_dispatch event
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp-with-drive:
+  secure_rdp:
+    # Runs on Windows runner
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 360  # Max 6 hours per GitHub runner
 
     steps:
-      - name: Configure Core RDP Settings
+      # Step 1: Setup RDP for remote desktop access
+      - name: Configure RDP settings
         shell: pwsh
         run: |
+          # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          # Allow Network Level Authentication
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          try { netsh advfirewall firewall delete rule name="RDP-Tailscale" } catch {}
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+          # Allow inbound connections on port 3389
+          netsh advfirewall firewall add rule name="RDP" protocol=TCP dir=in localport=3389 action=allow
+          # Restart Remote Desktop Services
+          Restart-Service TermService -Force
           Write-Host "✅ RDP configured"
 
-      - name: Create RDP User with Fixed Password
+      # Step 2: Create fixed user for RDP access
+      - name: Create RDP user
         shell: pwsh
         run: |
-          $username = "RDP"
-          $password = "124421Sg"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
-            Add-LocalGroupMember -Group "Administrators" -Member $username
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-            Write-Host "✅ RDP user created"
+          $user = "RDP"
+          $pass = "124421Sg"  # Your chosen password
+          $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $user -Password $securePass -FullName "Remote User" -Description "User for RDP"
+              Add-LocalGroupMember -Group Administrators -Member $user
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user
+              Write-Host "✅ RDP user created"
           } else {
-            Set-LocalUser -Name $username -Password $securePass
-            Write-Host "✅ RDP user password updated"
+              Set-LocalUser -Name $user -Password $securePass
+              Write-Host "✅ RDP user password updated"
           }
-          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          echo "RDP_USER=$user" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
 
+      # Step 3: Install Chocolatey package manager
       - name: Install Chocolatey
         shell: pwsh
         run: |
@@ -46,6 +53,7 @@ jobs:
           iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
           Write-Host "✅ Chocolatey installed"
 
+      # Step 4: Install Tailscale and rclone
       - name: Install Tailscale and rclone
         shell: pwsh
         run: |
@@ -53,63 +61,84 @@ jobs:
           choco install rclone -y
           Write-Host "✅ Tailscale and rclone installed"
 
-      - name: Start Tailscale
+      # Step 5: Start Tailscale client
+      - name: Start and connect Tailscale
         shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) { Write-Error "No TAILSCALE_AUTH_KEY"; exit 1 }
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname="gh-rdp-${env:GITHUB_RUN_ID}"
-          $tsIP = ""
-          for ($i = 0; $i -lt 12; $i++) {
+          # Connect to Tailscale network using auth key
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname="gh-rdp-$env:GITHUB_RUN_ID"
+          # Poll for tailscale IP
+          $ip = ""
+          for ($i=0; $i -lt 12; $i++) {
             Start-Sleep -Seconds 5
-            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-            if ($tsIP -and $tsIP.Trim() -ne "") { break }
+            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            if ($ip -and $ip.Trim() -ne "") { break }
           }
-          if (-not $tsIP -or $tsIP.Trim() -eq "") { Write-Error "No Tailscale IP assigned"; exit 1 }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "✅ Tailscale up: $tsIP"
+          if (-not $ip -or $ip.Trim() -eq "") { Write-Error "Failed to get Tailscale IP"; exit 1 }
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected: $ip"
 
-      - name: Setup rclone config for Google Drive
+      # Step 6: Configure rclone to use Google Drive
+      - name: Configure rclone for Google Drive
         shell: pwsh
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
         run: |
-          $rcloneDir = "$env:USERPROFILE\.config\rclone"
-          if (!(Test-Path $rcloneDir)) { New-Item -Type Directory -Path $rcloneDir -Force | Out-Null }
-          $config = "[gdrive]`ntype = drive`nclient_id = $env:GOOGLE_CLIENT_ID`nclient_secret = $env:GOOGLE_CLIENT_SECRET`ntoken = $env:GOOGLE_TOKEN"
-          $rcloneConfigPath = "$rcloneDir\rclone.conf"
-          $config | Set-Content -Path $rcloneConfigPath -Encoding UTF8
+          # Create rclone config directory
+          $configDir = "$env:USERPROFILE\.config\rclone"
+          if (!(Test-Path $configDir)) { New-Item -ItemType Directory -Path $configDir -Force }
+          
+          # Create rclone config content
+          $configContent = "[gdrive]`ntype = drive`nclient_id = $env:GOOGLE_CLIENT_ID`nclient_secret = $env:GOOGLE_CLIENT_SECRET`nscope = drive`ntoken = $env:GOOGLE_TOKEN"
+          
+          # Write config file
+          $configFile = "$configDir\rclone.conf"
+          $configContent | Set-Content -Path $configFile -Encoding UTF8
           Write-Host "✅ rclone config created"
 
-      - name: Mount Google Drive as D:
+      # Step 7: Mount Google Drive as D: drive
+      - name: Mount Google Drive
         shell: pwsh
         run: |
-          Start-Process -NoNewWindow -FilePath "rclone" -ArgumentList "mount gdrive: D: --config $env:USERPROFILE\.config\rclone\rclone.conf --vfs-cache-mode full --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off"
-          for ($i = 0; $i -lt 10; $i++) {
+          # Start rclone mount in background
+          Start-Process -FilePath "rclone" -ArgumentList "mount", "gdrive:", "D:", "--config", "$env:USERPROFILE\.config\rclone\rclone.conf", "--vfs-cache-mode", "full", "--vfs-read-chunk-size", "128M", "--vfs-read-chunk-size-limit", "off" -WindowStyle Hidden
+          
+          # Wait for mount to be ready
+          for ($i=0; $i -lt 10; $i++) {
             Start-Sleep -Seconds 4
-            if (Test-Path "D:\") { Write-Host "✅ Google Drive mounted to D:\"; break }
+            if (Test-Path "D:\") { 
+              Write-Host "✅ Google Drive mounted as D:\"
+              break 
+            }
           }
 
-      - name: Status Info & Connection Details
+      # Step 8: Display connection info
+      - name: Show connection info
         shell: pwsh
         run: |
           Write-Host ""
           Write-Host "🎯 RDP CONNECTION DETAILS:"
           Write-Host "========================="
-          Write-Host "PC Name/IP: $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USERNAME"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "Drive: D: (Google Drive, 2TB)"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "Google Drive: D:\ (2TB)"
           Write-Host ""
-          Write-Host "PC: Use mstsc.exe, enter the above credentials & Tailscale IP"
-          Write-Host "Android: Use Microsoft RDP, enter the above credentials & IP"
+          Write-Host "📱 Android: Use Microsoft Remote Desktop app"
+          Write-Host "💻 Windows: Use mstsc.exe or Remote Desktop Connection"
+          Write-Host "⏱️  Max runtime: 6 hours"
           Write-Host "========================="
 
-      - name: Keep Alive
+      # Step 9: Keep workflow active (prevents auto-termination)
+      - name: Keep alive
         shell: pwsh
         run: |
-          Write-Host "RDP SESSION ACTIVE! (Ends after 6hr or workflow cancelled)"
-          while ($true) { Start-Sleep -Seconds 300 }
+          Write-Host "🔄 RDP session is now active and ready!"
+          Write-Host "📝 Cancel this workflow to stop the session"
+          while ($true) {
+            Start-Sleep -Seconds 300  # Check every 5 minutes
+          }
