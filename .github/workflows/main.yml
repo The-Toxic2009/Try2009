@@ -1,122 +1,117 @@
 name: RDP-with-GoogleDrive
 
-# Workflow triggers manually via workflow_dispatch event
 on:
   workflow_dispatch:
 
 jobs:
   secure_rdp:
-    # Runs on Windows runner
     runs-on: windows-latest
-    timeout-minutes: 360  # Max 6 hours per GitHub runner
+    timeout-minutes: 360
 
     steps:
-      # Step 1: Setup RDP for remote desktop access
+      # Step 1: Setup RDP
       - name: Configure RDP settings
         shell: pwsh
         run: |
-          # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          # Allow Network Level Authentication
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          # Allow inbound connections on port 3389
           netsh advfirewall firewall add rule name="RDP" protocol=TCP dir=in localport=3389 action=allow
-          # Restart Remote Desktop Services
           Restart-Service TermService -Force
           Write-Host "✅ RDP configured"
 
-      # Step 2: Create fixed user for RDP access
+      # Step 2: Create RDP user
       - name: Create RDP user
         shell: pwsh
         run: |
           $user = "RDP"
-          $pass = "124421Sg"  # Your chosen password
+          $pass = "124421Sg"
           $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
           if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name $user -Password $securePass -FullName "Remote User" -Description "User for RDP"
+              New-LocalUser -Name $user -Password $securePass -FullName "Remote User"
               Add-LocalGroupMember -Group Administrators -Member $user
               Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user
-              Write-Host "✅ RDP user created"
           } else {
               Set-LocalUser -Name $user -Password $securePass
-              Write-Host "✅ RDP user password updated"
           }
           echo "RDP_USER=$user" >> $env:GITHUB_ENV
           echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
 
-      # Step 3: Install Chocolatey package manager
+      # Step 3: Install tools
       - name: Install Chocolatey
         shell: pwsh
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
-          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
           iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-          Write-Host "✅ Chocolatey installed"
 
-      # Step 4: Install Tailscale and rclone
       - name: Install Tailscale and rclone
         shell: pwsh
         run: |
           choco install tailscale -y
           choco install rclone -y
-          Write-Host "✅ Tailscale and rclone installed"
+          choco install winfsp -y  # Required for Windows mounting
+          Write-Host "✅ Tools installed"
 
-      # Step 5: Start Tailscale client
-      - name: Start and connect Tailscale
+      # Step 4: Start Tailscale
+      - name: Start Tailscale
         shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Connect to Tailscale network using auth key
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname="gh-rdp-$env:GITHUB_RUN_ID"
-          # Poll for tailscale IP
           $ip = ""
           for ($i=0; $i -lt 12; $i++) {
             Start-Sleep -Seconds 5
             $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
             if ($ip -and $ip.Trim() -ne "") { break }
           }
-          if (-not $ip -or $ip.Trim() -eq "") { Write-Error "Failed to get Tailscale IP"; exit 1 }
           echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "✅ Tailscale connected: $ip"
+          Write-Host "✅ Tailscale: $ip"
 
-      # Step 6: Configure rclone to use Google Drive
-      - name: Configure rclone for Google Drive
+      # Step 5: Configure rclone
+      - name: Setup rclone config
         shell: pwsh
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
         run: |
-          # Create rclone config directory
           $configDir = "$env:USERPROFILE\.config\rclone"
           if (!(Test-Path $configDir)) { New-Item -ItemType Directory -Path $configDir -Force }
-          
-          # Create rclone config content
           $configContent = "[gdrive]`ntype = drive`nclient_id = $env:GOOGLE_CLIENT_ID`nclient_secret = $env:GOOGLE_CLIENT_SECRET`nscope = drive`ntoken = $env:GOOGLE_TOKEN"
+          $configPath = "$configDir\rclone.conf"
+          $configContent | Set-Content -Path $configPath -Encoding UTF8
           
-          # Write config file
-          $configFile = "$configDir\rclone.conf"
-          $configContent | Set-Content -Path $configFile -Encoding UTF8
-          Write-Host "✅ rclone config created"
+          # Test connection first
+          rclone ls gdrive: --max-items 5
+          Write-Host "✅ rclone configured and tested"
 
-      # Step 7: Mount Google Drive as D: drive
-      - name: Mount Google Drive
+      # Step 6: Create persistent mount script
+      - name: Create mount script and service
         shell: pwsh
         run: |
-          # Start rclone mount in background
-          Start-Process -FilePath "rclone" -ArgumentList "mount", "gdrive:", "D:", "--config", "$env:USERPROFILE\.config\rclone\rclone.conf", "--vfs-cache-mode", "full", "--vfs-read-chunk-size", "128M", "--vfs-read-chunk-size-limit", "off" -WindowStyle Hidden
+          # Create mount script
+          $mountScript = @"
+          @echo off
+          cd /d "C:\ProgramData\chocolatey\bin"
+          rclone mount gdrive: G: --config "$env:USERPROFILE\.config\rclone\rclone.conf" --vfs-cache-mode full --vfs-read-chunk-size 128M --network-mode --allow-other
+          "@
           
-          # Wait for mount to be ready
-          for ($i=0; $i -lt 10; $i++) {
-            Start-Sleep -Seconds 4
-            if (Test-Path "D:\") { 
-              Write-Host "✅ Google Drive mounted as D:\"
+          $mountScript | Set-Content -Path "C:\mount_gdrive.bat" -Encoding ASCII
+          
+          # Start mount in background
+          Start-Process -FilePath "C:\mount_gdrive.bat" -WindowStyle Hidden
+          
+          # Wait for mount
+          for ($i=0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 5
+            if (Test-Path "G:\") { 
+              Write-Host "✅ Google Drive mounted as G:\"
               break 
             }
+            Write-Host "Waiting for mount... ($i/15)"
           }
 
-      # Step 8: Display connection info
+      # Step 7: Display info
       - name: Show connection info
         shell: pwsh
         run: |
@@ -126,19 +121,23 @@ jobs:
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASS"
-          Write-Host "Google Drive: D:\ (2TB)"
+          Write-Host "Google Drive: G:\ (2TB)"
           Write-Host ""
-          Write-Host "📱 Android: Use Microsoft Remote Desktop app"
-          Write-Host "💻 Windows: Use mstsc.exe or Remote Desktop Connection"
+          Write-Host "📱 Connect via Microsoft Remote Desktop"
           Write-Host "⏱️  Max runtime: 6 hours"
           Write-Host "========================="
 
-      # Step 9: Keep workflow active (prevents auto-termination)
-      - name: Keep alive
+      # Step 8: Keep alive with mount monitoring
+      - name: Keep alive and monitor mount
         shell: pwsh
         run: |
-          Write-Host "🔄 RDP session is now active and ready!"
-          Write-Host "📝 Cancel this workflow to stop the session"
+          Write-Host "🔄 Session active with Google Drive monitoring"
           while ($true) {
-            Start-Sleep -Seconds 300  # Check every 5 minutes
+            Start-Sleep -Seconds 300
+            # Check if mount is still active
+            if (!(Test-Path "G:\")) {
+              Write-Host "⚠️ Mount lost, attempting to remount..."
+              Start-Process -FilePath "C:\mount_gdrive.bat" -WindowStyle Hidden
+              Start-Sleep -Seconds 30
+            }
           }
