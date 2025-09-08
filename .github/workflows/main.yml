@@ -1,4 +1,4 @@
-name: RDP-and-Drive-BiSync
+name: RDP-and-Drive-BiSync-Fixed
 
 on:
   workflow_dispatch:
@@ -9,7 +9,6 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # --- Basic RDP, Chocolatey, and Tailscale setup (reduced for clarity) ---
       - name: Configure RDP and create user
         shell: pwsh
         run: |
@@ -29,14 +28,16 @@ jobs:
           }
           echo "RDP_USER=$user" >> $env:GITHUB_ENV
           echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
+          Write-Host "✅ RDP configured and user created"
 
-      - name: Install Chocolatey, Tailscale, rclone
+      - name: Install tools
         shell: pwsh
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
           iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
           choco install tailscale -y
           choco install rclone -y
+          Write-Host "✅ Chocolatey, Tailscale, and rclone installed"
 
       - name: Start Tailscale
         shell: pwsh
@@ -51,6 +52,7 @@ jobs:
             if ($ip -and $ip.Trim() -ne "") { break }
           }
           echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected: $ip"
 
       - name: Configure rclone for Google Drive
         shell: pwsh
@@ -64,45 +66,54 @@ jobs:
           $configContent = "[gdrive]`ntype = drive`nclient_id = $env:GOOGLE_CLIENT_ID`nclient_secret = $env:GOOGLE_CLIENT_SECRET`nscope = drive`ntoken = $env:GOOGLE_TOKEN"
           $configPath = "$configDir\rclone.conf"
           $configContent | Set-Content -Path $configPath -Encoding UTF8
+          Write-Host "✅ rclone configured"
 
-      # --- Initial download from Google Drive /storage to Desktop\persistent ---
-      - name: Download from storage (Drive) to Desktop\persistent
+      - name: Download storage folder to Desktop\persistent (with abuse bypass)
         shell: pwsh
         run: |
           $persistent = "$env:USERPROFILE\Desktop\persistent"
-          if (!(Test-Path $persistent)) { New-Item -ItemType Directory -Path $persistent }
-          rclone copy "gdrive:/storage" $persistent --config "$env:USERPROFILE\.config\rclone\rclone.conf" --progress
+          if (!(Test-Path $persistent)) { New-Item -ItemType Directory -Path $persistent -Force }
+          rclone copy "gdrive:/storage" $persistent --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --progress --verbose
+          Write-Host "✅ Files downloaded to Desktop\persistent (including flagged APK files)"
 
-      # --- Bi-directional sync every 30 min; final sync at end, keep alive ---
-      - name: Bi-directional sync every 30 min; final sync at exit
+      - name: Bi-directional sync every 30 min with abuse bypass and final sync
         shell: pwsh
         run: |
           $local = "$env:USERPROFILE\Desktop\persistent"
           $remote = "gdrive:/storage"
-          # First run with --resync to initialize state
-          rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --resync --verbose
+          
+          # Initial resync with abuse acknowledgment
+          Write-Host "🔄 Starting initial resync..."
+          rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --resync --verbose
+          
           try {
             while ($true) {
-              Write-Host "Starting bisync..."
-              rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --verbose
-              Write-Host "Bi-directional sync complete. Sleeping for 30 minutes..."
+              Write-Host "🔄 Starting 30-minute bisync cycle..."
+              rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
+              Write-Host "✅ Bi-directional sync complete. Sleeping for 30 minutes..."
               Start-Sleep -Seconds 1800
             }
           }
           finally {
-            Write-Host "Final sync before exit..."
-            rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --verbose
-            Write-Host "Final sync complete."
+            Write-Host "🔄 Final sync before session ends..."
+            rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
+            Write-Host "✅ Final sync complete"
           }
 
       - name: Show connection info
         shell: pwsh
         run: |
           Write-Host ""
-          Write-Host "======================"
-          Write-Host "RDP CONNECTION DETAILS"
+          Write-Host "🎯 RDP CONNECTION DETAILS:"
+          Write-Host "========================="
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASS"
-          Write-Host "Google Drive folder: Desktop\persistent  <-->  /storage"
-          Write-Host "======================"
+          Write-Host "Storage: Desktop\persistent ↔ Google Drive /storage"
+          Write-Host "Sync: Every 30 minutes + final sync on exit"
+          Write-Host "Features: Virus scan bypass enabled for APK files"
+          Write-Host ""
+          Write-Host "📱 Android: Microsoft Remote Desktop app"
+          Write-Host "💻 Windows: mstsc.exe (Win+R → mstsc)"
+          Write-Host "⏱️ Max runtime: 6 hours"
+          Write-Host "========================="
