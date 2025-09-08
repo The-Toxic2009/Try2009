@@ -1,0 +1,130 @@
+# .github/workflows/main2.yaml
+name: RDP-and-Drive-BiSync-Secondary
+
+on:
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        required: true
+      loop_id:
+        required: true
+  schedule:
+    - cron: '30 2,7,12,17,22 * * *'  # 2:30 AM/7:30AM/12:30PM/5:30PM/10:30PM (offset 2.5h)
+
+jobs:
+  rdp_bisync_secondary:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      LOOP_ID: secondary
+    steps:
+
+      - name: Configure RDP and create user
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP" protocol=TCP dir=in localport=3389 action=allow
+          Restart-Service TermService -Force
+          $user = "RDP"
+          $pass = "124421Sg"
+          $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $user -Password $securePass -FullName "Remote User"
+            Add-LocalGroupMember -Group Administrators -Member $user
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user
+          } else {
+            Set-LocalUser -Name $user -Password $securePass
+          }
+          echo "RDP_USER=$user" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
+          Write-Host "✅ RDP configured and user created"
+
+      - name: Install tools
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          choco install tailscale -y
+          choco install rclone -y
+          Write-Host "✅ Chocolatey, Tailscale, and rclone installed"
+
+      - name: Start Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname="gh-rdp-$env:GITHUB_RUN_ID"
+          $ip = ""
+          for ($i=0; $i -lt 12; $i++) {
+            Start-Sleep -Seconds 5
+            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            if ($ip -and $ip.Trim() -ne "") { break }
+          }
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected: $ip"
+
+      - name: Download storage folder to Desktop\persistent (with abuse bypass)
+        shell: pwsh
+        run: |
+          $persistent = "$env:USERPROFILE\Desktop\persistent"
+          if (!(Test-Path $persistent)) { New-Item -ItemType Directory -Path $persistent -Force }
+          rclone copy "gdrive:/storage" $persistent --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --progress --verbose
+          Write-Host "✅ Files downloaded to Desktop\persistent (including flagged APK files)"
+
+      - name: Grant full permissions on persistent folder for RDP user
+        shell: pwsh
+        run: |
+          $persistent = "$env:USERPROFILE\Desktop\persistent"
+          icacls $persistent /grant RDP:(OI)(CI)F /T
+          Write-Host "✅ Granted full permissions for RDP user on persistent folder"
+
+      - name: Bi-directional sync every 30 min with abuse bypass and final sync
+        shell: pwsh
+        run: |
+          $local = "$env:USERPROFILE\Desktop\persistent"
+          $remote = "gdrive:/storage"
+          
+          Write-Host "🔄 Starting initial resync..."
+          rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --resync --verbose
+
+          for ($i=0; $i -lt 9; $i++) {
+              Write-Host "🔄 Starting 30-minute bisync cycle..."
+              rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
+              Write-Host "✅ Bi-directional sync complete. Sleeping for 30 minutes..."
+              Start-Sleep -Seconds 1800
+          }
+
+          Write-Host "🔄 Final sync before session ends..."
+          rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
+          Write-Host "✅ Final sync complete"
+
+      - name: Trigger main workflow
+        uses: peter-evans/workflow-dispatch@v1
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          repository: ${{ github.repository }}
+          workflow: main.yaml
+          ref: main
+          inputs: |
+            triggered_by: main2
+            loop_id: secondary
+
+      - name: Show connection info
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "🎯 RDP CONNECTION DETAILS:"
+          Write-Host "========================="
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "Storage: Desktop\persistent ↔ Google Drive /storage"
+          Write-Host "Sync: Every 30 minutes + final sync on exit"
+          Write-Host "Features: Virus scan bypass enabled for APK files"
+          Write-Host ""
+          Write-Host "📱 Android: Microsoft Remote Desktop app"
+          Write-Host "💻 Windows: mstsc.exe (Win+R → mstsc)"
+          Write-Host "⏱️ Max runtime: 6 hours"
+          Write-Host "========================="
+          
