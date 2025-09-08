@@ -1,14 +1,19 @@
-name: RDP-and-Drive-BiSync-Fixed
+# .github/workflows/main.yaml
+name: RDP-and-Drive-BiSync-Main
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'  # every 5 hours
 
 jobs:
   rdp_bisync:
     runs-on: windows-latest
-    timeout-minutes: 360
-
+    timeout-minutes: 360  # 6 hours
+    env:
+      LOOP_ID: main
     steps:
+
       - name: Configure RDP and create user
         shell: pwsh
         run: |
@@ -76,6 +81,13 @@ jobs:
           rclone copy "gdrive:/storage" $persistent --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --progress --verbose
           Write-Host "✅ Files downloaded to Desktop\persistent (including flagged APK files)"
 
+      - name: Grant full permissions on persistent folder for RDP user
+        shell: pwsh
+        run: |
+          $persistent = "$env:USERPROFILE\Desktop\persistent"
+          icacls $persistent /grant RDP:(OI)(CI)F /T
+          Write-Host "✅ Granted full permissions for RDP user on persistent folder"
+
       - name: Bi-directional sync every 30 min with abuse bypass and final sync
         shell: pwsh
         run: |
@@ -87,7 +99,7 @@ jobs:
           rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --resync --verbose
           
           try {
-            while ($true) {
+            for ($i=0; $i -lt 9; $i++) {
               Write-Host "🔄 Starting 30-minute bisync cycle..."
               rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
               Write-Host "✅ Bi-directional sync complete. Sleeping for 30 minutes..."
@@ -99,6 +111,17 @@ jobs:
             rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
             Write-Host "✅ Final sync complete"
           }
+
+      - name: Trigger secondary workflow
+        uses: peter-evans/workflow-dispatch@v1
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          repository: ${{ github.repository }}
+          workflow: main2.yaml
+          ref: main
+          inputs: |
+            triggered_by: main
+            loop_id: main
 
       - name: Show connection info
         shell: pwsh
