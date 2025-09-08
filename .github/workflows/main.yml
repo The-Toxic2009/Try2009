@@ -1,26 +1,22 @@
-name: RDP-with-GoogleDrive
+name: RDP-and-Drive-BiSync
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure_rdp:
+  rdp_bisync:
     runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: Configure RDP settings
+      # --- Basic RDP, Chocolatey, and Tailscale setup (reduced for clarity) ---
+      - name: Configure RDP and create user
         shell: pwsh
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           netsh advfirewall firewall add rule name="RDP" protocol=TCP dir=in localport=3389 action=allow
           Restart-Service TermService -Force
-          Write-Host "RDP configured"
-
-      - name: Create RDP user
-        shell: pwsh
-        run: |
           $user = "RDP"
           $pass = "124421Sg"
           $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
@@ -34,18 +30,13 @@ jobs:
           echo "RDP_USER=$user" >> $env:GITHUB_ENV
           echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
 
-      - name: Install Chocolatey
+      - name: Install Chocolatey, Tailscale, rclone
         shell: pwsh
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
           iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-
-      - name: Install tools
-        shell: pwsh
-        run: |
           choco install tailscale -y
           choco install rclone -y
-          choco install winfsp -y
 
       - name: Start Tailscale
         shell: pwsh
@@ -60,9 +51,8 @@ jobs:
             if ($ip -and $ip.Trim() -ne "") { break }
           }
           echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "Tailscale connected: $ip"
 
-      - name: Setup rclone config
+      - name: Configure rclone for Google Drive
         shell: pwsh
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -74,44 +64,45 @@ jobs:
           $configContent = "[gdrive]`ntype = drive`nclient_id = $env:GOOGLE_CLIENT_ID`nclient_secret = $env:GOOGLE_CLIENT_SECRET`nscope = drive`ntoken = $env:GOOGLE_TOKEN"
           $configPath = "$configDir\rclone.conf"
           $configContent | Set-Content -Path $configPath -Encoding UTF8
-          Write-Host "rclone config created"
 
-      - name: Test and mount Google Drive
+      # --- Initial download from Google Drive /storage to Desktop\persistent ---
+      - name: Download from storage (Drive) to Desktop\persistent
         shell: pwsh
         run: |
-          Write-Host "Testing rclone connection..."
-          rclone ls gdrive: --max-depth 1
-          Write-Host "Starting mount process..."
-          Start-Job -ScriptBlock { rclone mount gdrive: G: --config "$env:USERPROFILE\.config\rclone\rclone.conf" --vfs-cache-mode full --network-mode }
-          for ($i=0; $i -lt 15; $i++) {
-            Start-Sleep -Seconds 5
-            if (Test-Path "G:\") { 
-              Write-Host "Google Drive mounted as G:\"
-              break 
+          $persistent = "$env:USERPROFILE\Desktop\persistent"
+          if (!(Test-Path $persistent)) { New-Item -ItemType Directory -Path $persistent }
+          rclone copy "gdrive:/storage" $persistent --config "$env:USERPROFILE\.config\rclone\rclone.conf" --progress
+
+      # --- Bi-directional sync every 30 min; final sync at end, keep alive ---
+      - name: Bi-directional sync every 30 min; final sync at exit
+        shell: pwsh
+        run: |
+          $local = "$env:USERPROFILE\Desktop\persistent"
+          $remote = "gdrive:/storage"
+          # First run with --resync to initialize state
+          rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --resync --verbose
+          try {
+            while ($true) {
+              Write-Host "Starting bisync..."
+              rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --verbose
+              Write-Host "Bi-directional sync complete. Sleeping for 30 minutes..."
+              Start-Sleep -Seconds 1800
             }
-            Write-Host "Waiting for mount... ($($i+1)/15)"
+          }
+          finally {
+            Write-Host "Final sync before exit..."
+            rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --verbose
+            Write-Host "Final sync complete."
           }
 
       - name: Show connection info
         shell: pwsh
         run: |
           Write-Host ""
-          Write-Host "RDP CONNECTION DETAILS:"
-          Write-Host "======================="
+          Write-Host "======================"
+          Write-Host "RDP CONNECTION DETAILS"
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASS"
-          Write-Host "Google Drive: G:\ drive"
-          Write-Host "======================="
-
-      - name: Keep alive
-        shell: pwsh
-        run: |
-          Write-Host "RDP session active - Connect using the details above"
-          while ($true) {
-            Start-Sleep -Seconds 300
-            if (!(Test-Path "G:\")) {
-              Write-Host "Remounting Google Drive..."
-              Start-Job -ScriptBlock { rclone mount gdrive: G: --config "$env:USERPROFILE\.config\rclone\rclone.conf" --vfs-cache-mode full --network-mode }
-            }
-          }
+          Write-Host "Google Drive folder: Desktop\persistent  <-->  /storage"
+          Write-Host "======================"
