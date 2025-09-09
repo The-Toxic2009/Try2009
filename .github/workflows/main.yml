@@ -1,19 +1,17 @@
-# .github/workflows/main.yaml
 name: RDP-and-Drive-BiSync-Main
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'  # every 5 hours
+    - cron: '0 */5 * * *'  # Every 5 hours
 
 jobs:
   rdp_bisync:
     runs-on: windows-latest
-    timeout-minutes: 360  # 6 hours
+    timeout-minutes: 360
     env:
       LOOP_ID: main
     steps:
-
       - name: Configure RDP and create user
         shell: pwsh
         run: |
@@ -85,32 +83,23 @@ jobs:
         shell: pwsh
         run: |
           $persistent = "$env:USERPROFILE\Desktop\persistent"
-          icacls $persistent /grant RDP:(OI)(CI)F /T
+          icacls $persistent /grant "RDP:(OI)(CI)F" /T
           Write-Host "✅ Granted full permissions for RDP user on persistent folder"
 
-      - name: Bi-directional sync every 30 min with abuse bypass and final sync
+      - name: Wait for 4 hours before sync
+        shell: pwsh
+        run: |
+          Write-Host "Sleeping for 4 hours before sync..."
+          Start-Sleep -Seconds 14400
+
+      - name: Bi-directional sync with abuse bypass
         shell: pwsh
         run: |
           $local = "$env:USERPROFILE\Desktop\persistent"
           $remote = "gdrive:/storage"
-          
-          # Initial resync with abuse acknowledgment
-          Write-Host "🔄 Starting initial resync..."
+          Write-Host "🔄 Sync after 4 hours..."
           rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --resync --verbose
-          
-          try {
-            for ($i=0; $i -lt 9; $i++) {
-              Write-Host "🔄 Starting 30-minute bisync cycle..."
-              rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
-              Write-Host "✅ Bi-directional sync complete. Sleeping for 30 minutes..."
-              Start-Sleep -Seconds 1800
-            }
-          }
-          finally {
-            Write-Host "🔄 Final sync before session ends..."
-            rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
-            Write-Host "✅ Final sync complete"
-          }
+          Write-Host "✅ Sync complete"
 
       - name: Trigger secondary workflow using API
         uses: actions/github-script@v7
@@ -138,7 +127,7 @@ jobs:
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASS"
           Write-Host "Storage: Desktop\persistent ↔ Google Drive /storage"
-          Write-Host "Sync: Every 30 minutes + final sync on exit"
+          Write-Host "Sync: After 4 hours + handoff"
           Write-Host "Features: Virus scan bypass enabled for APK files"
           Write-Host ""
           Write-Host "📱 Android: Microsoft Remote Desktop app"
