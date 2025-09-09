@@ -118,17 +118,16 @@ jobs:
 
       - name: Install VMware Workstation from cloned EXE
         shell: pwsh
+        continue-on-error: true
         run: |
-          $exePath = "C:\Users\runneradmin\Desktop\persistent\VMware-workstation-full-17.6.4-24832109.exe"
-          if (Test-Path $exePath) {
-            Start-Process -FilePath $exePath `
-                          -ArgumentList '/S','/v"/qn ADDLOCAL=All"' `
-                          -Wait `
-                          -NoNewWindow `
-                          -Verb RunAs
-          } else {
-            Write-Warning "VMware installer not found at $exePath"
-          }
+         $exePath = "C:\Users\runneradmin\Desktop\persistent\VMware-workstation-full-17.6.4-24832109.exe"
+         if (Test-Path $exePath) {
+         Write-Host "Installing VMware from $exePath"
+         Start-Process -FilePath $exePath -ArgumentList '/S','/v"/qn ADDLOCAL=All"' -Wait
+         } else {
+         Write-Warning "VMware installer not found at $exePath"
+         }
+    
 
       - name: Wait until 5h30m for secondary start
         shell: pwsh
