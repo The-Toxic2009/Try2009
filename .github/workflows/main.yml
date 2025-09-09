@@ -103,24 +103,6 @@ jobs:
           token = $env:GOOGLE_TOKEN
           "@ | Set-Content "$cfg\rclone.conf"
 
-    - name: Create VMware config.ini
-  shell: pwsh
-  run: |
-    $dir = "$env:APPDATA\VMware"
-    if (!(Test-Path $dir)) { New-Item $dir -ItemType Directory -Force }
-    New-Item "$dir\config.ini" -ItemType File -Force
-
-    # Build the account name with machine context
-    $acct = "$env:COMPUTERNAME\$env:RDP_USER"
-    Write-Host "Granting full control on $dir to $acct"
-
-    # Grant full permissions recursively
-    icacls $dir /grant "$acct:(OI)(CI)F" /T
-
-    Write-Host "✅ VMware config.ini created and permissions set"
-
-
-
       - name: Download storage to Desktop\persistent
         shell: pwsh
         run: |
