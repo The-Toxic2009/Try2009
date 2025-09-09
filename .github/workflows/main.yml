@@ -1,4 +1,3 @@
-# .github/workflows/main.yaml
 name: RDP-and-Drive-BiSync-Main-Automated
 
 on:
@@ -7,119 +6,131 @@ on:
     - cron: '0 */6 * * *'  # Every 6 hours
 
 jobs:
-  rdp_bisync:
+  setup:
     runs-on: windows-latest
     timeout-minutes: 390  # 6.5 hours
     env:
-      LOOP_ID: main
+      RDP_USER: 'RDP'
+      RDP_PASS: ${{ secrets.RDP_PASS }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
+
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-      - name: Configure RDP and create user
-        shell: pwsh
-        run: |
-         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
-          netsh advfirewall firewall add rule name=RDP protocol=TCP dir=in localport=3389 action=allow
-          Restart-Service TermService -Force
-          $user='RDP'; $pass='124421Sg'
-          $sec=ConvertTo-SecureString $pass -AsPlainText -Force
-          if (-not (Get-LocalUser $user -ErrorAction SilentlyContinue)) {
-            New-LocalUser $user -Password $sec -FullName 'Remote User'
-            Add-LocalGroupMember Administrators,$user
-            Add-LocalGroupMember 'Remote Desktop Users',$user
-          } else { Set-LocalUser $user -Password $sec }
-          echo "RDP_USER=$user">>$env:GITHUB_ENV
-          echo "RDP_PASS=$pass">>$env:GITHUB_ENV
-          Write-Host "✅ RDP user configured"
+      - name: Cache Chocolatey packages
+        uses: actions/cache@v3
+        with:
+          path: C:\ProgramData\chocolatey\lib
+          key: ${{ runner.os }}-choco-cache
 
-      - name: Install Chocolatey, Tailscale, and rclone
+      - name: Install Chocolatey and Tools
         shell: pwsh
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
           iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-          choco install tailscale -y
-          choco install rclone -y
-          Write-Host "✅ Tools installed"
+          choco install tailscale rclone vmwareworkstation -y --no-progress
 
-      - name: Install VMware Workstation
+      - name: Configure RDP user and permissions
         shell: pwsh
         run: |
-          try {
-            choco install vmwareworkstation -y --timeout=600
-            Write-Host "✅ VMware Workstation installed"
-          } catch {
-            Write-Host "⚠️ VMware install failed"
+          # Enable RDP and disable Network Level Auth
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+          netsh advfirewall firewall add rule name=RDP protocol=TCP dir=in localport=3389 action=allow
+          Restart-Service TermService -Force
+
+          # Create or update RDP user
+          $securePass = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $env:RDP_USER -Password $securePass -FullName 'Remote User' -ErrorAction Stop
+          } else {
+            Set-LocalUser -Name $env:RDP_USER -Password $securePass -ErrorAction Stop
           }
 
-      - name: Start Tailscale
+          # Add to Administrators and Remote Desktop Users groups
+          Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USER -ErrorAction Stop
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER -ErrorAction Stop
+
+          # Expose creds
+          echo "RDP_USER=$env:RDP_USER" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$env:RDP_PASS" >> $env:GITHUB_ENV
+
+          Write-Host "✅ RDP user configured and permissions set"
+
+      - name: Start and approve Tailscale
         shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname="gh-rdp-main-$env:GITHUB_RUN_ID"
-          for ($i=0; $i -lt 12; $i++) {
-            Start-Sleep 5
-            $ip=&"$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Seconds 5
+            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
             if ($ip) { break }
           }
-          echo "TAILSCALE_IP=$ip">>$env:GITHUB_ENV
-          Write-Host "✅ Tailscale IP: $ip"
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
 
-      - name: Auto-approve Tailscale device via API
-        shell: pwsh
-        env:
-          TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
-        run: |
           if ($env:TAILSCALE_API_TOKEN) {
-            $node=( & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json ).Self.ID
+            $node = ( & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json ).Self.ID
             if ($node) {
-              $hdr=@{Authorization="Bearer $env:TAILSCALE_API_TOKEN"; 'Content-Type'='application/json'}
+              $hdr = @{ Authorization = "Bearer $env:TAILSCALE_API_TOKEN"; 'Content-Type' = 'application/json' }
               Invoke-RestMethod "https://api.tailscale.com/api/v2/device/$node/authorized" -Method Post -Headers $hdr -Body '{"authorized":true}'
-              Write-Host "✅ Device auto-approved"
+              Write-Host "✅ Tailscale device approved"
             }
           }
+
+          Write-Host "✅ Tailscale started at IP $ip"
 
       - name: Show connection info
         shell: pwsh
         run: |
           Write-Host "`n🎯 RDP CONNECTION DETAILS:"
-          Write-Host "==========================="
+          Write-Host "================================"
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "User: $env:RDP_USER / $env:RDP_PASS"
           Write-Host "Connect via Android or mstsc.exe"
           Write-Host "Session: 5 hours active, secondary starts with 30m left"
-          Write-Host "==========================="
+          Write-Host "================================"
 
       - name: Configure rclone for Google Drive
         shell: pwsh
-        env:
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
         run: |
-          $cfg="$env:USERPROFILE\.config\rclone"; if(!(Test-Path $cfg)){New-Item $cfg -ItemType Dir -Force}
-          "[gdrive]`ntype = drive`nclient_id = $env:GOOGLE_CLIENT_ID`nclient_secret = $env:GOOGLE_CLIENT_SECRET`nscope = drive`ntoken = $env:GOOGLE_TOKEN" | Set-Content "$cfg\rclone.conf"
+          $cfg = "$env:USERPROFILE\.config\rclone"
+          if (!(Test-Path $cfg)) { New-Item $cfg -ItemType Directory -Force }
+          @"
+          [gdrive]
+          type = drive
+          client_id = $env:GOOGLE_CLIENT_ID
+          client_secret = $env:GOOGLE_CLIENT_SECRET
+          scope = drive
+          token = $env:GOOGLE_TOKEN
+          "@ | Set-Content "$cfg\rclone.conf"
           Write-Host "✅ rclone configured"
 
       - name: Create VMware config.ini
         shell: pwsh
         run: |
-          $dir="$env:APPDATA\VMware"; if(!(Test-Path $dir)){New-Item $dir -ItemType Dir -Force}
+          $dir = "$env:APPDATA\VMware"
+          if (!(Test-Path $dir)) { New-Item $dir -ItemType Directory -Force }
           New-Item "$dir\config.ini" -ItemType File -Force
-          icacls "$dir" /grant "RDP:(OI)(CI)F" /T
+          icacls "$dir" /grant "$env:RDP_USER:(OI)(CI)F" /T
           Write-Host "✅ VMware config.ini created"
 
       - name: Download storage to Desktop\persistent
         shell: pwsh
         run: |
-          $dst="$env:USERPROFILE\Desktop\persistent"; if(!(Test-Path $dst)){New-Item $dst -ItemType Dir -Force}
-          rclone copy gdrive:/storage $dst --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --progress --verbose --retries 3 --timeout 10m
+          $dst = "$env:USERPROFILE\Desktop\persistent"
+          if (!(Test-Path $dst)) { New-Item $dst -ItemType Directory -Force }
+          rclone copy gdrive:/storage $dst --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --retries 3 --timeout 10m --verbose
           Write-Host "✅ Storage downloaded"
 
       - name: Grant persistent folder permissions
         shell: pwsh
         run: |
-          icacls "$env:USERPROFILE\Desktop\persistent" /grant "RDP:(OI)(CI)F" /T
+          icacls "$env:USERPROFILE\Desktop\persistent" /grant "$env:RDP_USER:(OI)(CI)F" /T
           Write-Host "✅ Permissions set"
 
       - name: Wait until 5h30m for secondary start
@@ -151,8 +162,8 @@ jobs:
       - name: Run final bi-directional sync
         shell: pwsh
         run: |
-          $loc="$env:USERPROFILE\Desktop\persistent"; $rem="gdrive:/storage"
-          rclone bisync $loc $rem --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --resync --resilient --create-empty-src-dirs --verbose --retries 3 --timeout 15m
+          $loc = "$env:USERPROFILE\Desktop\persistent"
+          rclone bisync $loc gdrive:/storage --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --resync --resilient --create-empty-src-dirs --retries 3 --timeout 15m --verbose
           Write-Host "✅ Final sync complete"
 
       - name: Session complete summary
@@ -163,4 +174,4 @@ jobs:
           Write-Host "🔄 Secondary started with 30m remaining"
           Write-Host "✅ Final sync done at $(Get-Date)"
           Write-Host "🔄 Secondary workflow will handle next cycle"
-          Write-Host "==========================="
+          Write-Host "==============================="
