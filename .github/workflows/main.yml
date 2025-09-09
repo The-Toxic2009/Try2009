@@ -38,13 +38,11 @@ jobs:
       - name: Configure RDP user and permissions
         shell: pwsh
         run: |
-          # Enable RDP and disable NLA
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
           netsh advfirewall firewall add rule name=RDP protocol=TCP dir=in localport=3389 action=allow
           Restart-Service TermService -Force
 
-          # Create or update RDP user
           $securePass = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
           if (-not (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name $env:RDP_USER -Password $securePass -FullName 'Remote User' -ErrorAction Stop
@@ -52,7 +50,6 @@ jobs:
             Set-LocalUser -Name $env:RDP_USER -Password $securePass -ErrorAction Stop
           }
 
-          # Add to groups
           Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USER -ErrorAction Stop
           Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER -ErrorAction Stop
 
@@ -112,8 +109,12 @@ jobs:
 
       - name: Grant persistent folder permissions
         shell: pwsh
+        continue-on-error: true
         run: |
-          icacls "C:\Users\runneradmin\Desktop\persistent" /grant "$env:RDP_USER:(OI)(CI)F" /T
+          $folder = "C:\Users\runneradmin\Desktop\persistent"
+          $user = "$env:COMPUTERNAME\$env:RDP_USER"
+          Write-Host "Granting permissions to $user on $folder"
+          icacls $folder /grant "$user:(OI)(CI)F" /T
 
       - name: Install VMware Workstation from cloned EXE
         shell: pwsh
@@ -167,3 +168,4 @@ jobs:
           Write-Host "✅ Final sync done at $(Get-Date)"
           Write-Host "🔄 Secondary workflow will handle next cycle"
           Write-Host "==============================="
+          
