@@ -11,7 +11,7 @@ on:
     - cron: '0 6,12,18 * * *'  # Every 6, 12, and 18 UTC
 
 jobs:
-  setup:
+  rdp_bisync_secondary:
     runs-on: windows-latest
     timeout-minutes: 390  # 6.5 hours
     env:
@@ -39,18 +39,16 @@ jobs:
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
           iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-          choco install tailscale rclone vmwareworkstation -y --no-progress
+          choco install tailscale rclone -y --no-progress
 
       - name: Configure RDP user and permissions (SECONDARY)
         shell: pwsh
         run: |
-          # Enable RDP and disable Network Level Auth
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
           netsh advfirewall firewall add rule name=RDP protocol=TCP dir=in localport=3389 action=allow
           Restart-Service TermService -Force
 
-          # Create or update RDP user
           $securePass = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
           if (-not (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name $env:RDP_USER -Password $securePass -FullName 'Remote User' -ErrorAction Stop
@@ -58,14 +56,11 @@ jobs:
             Set-LocalUser -Name $env:RDP_USER -Password $securePass -ErrorAction Stop
           }
 
-          # Add to Administrators and Remote Desktop Users
           Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USER -ErrorAction Stop
           Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER -ErrorAction Stop
 
           echo "RDP_USER=$env:RDP_USER" >> $env:GITHUB_ENV
           echo "RDP_PASS=$env:RDP_PASS" >> $env:GITHUB_ENV
-
-          Write-Host "✅ RDP user configured (SECONDARY)"
 
       - name: Start and approve Tailscale (SECONDARY)
         shell: pwsh
@@ -83,11 +78,8 @@ jobs:
             if ($node) {
               $hdr = @{ Authorization = "Bearer $env:TAILSCALE_API_TOKEN"; 'Content-Type' = 'application/json' }
               Invoke-RestMethod "https://api.tailscale.com/api/v2/device/$node/authorized" -Method Post -Headers $hdr -Body '{"authorized":true}'
-              Write-Host "✅ Tailscale device approved (SECONDARY)"
             }
           }
-
-          Write-Host "✅ Tailscale started at IP $ip (SECONDARY)"
 
       - name: Show connection info (SECONDARY)
         shell: pwsh
@@ -113,35 +105,40 @@ jobs:
           scope = drive
           token = $env:GOOGLE_TOKEN
           "@ | Set-Content "$cfg\rclone.conf"
-          Write-Host "✅ rclone configured (SECONDARY)"
-
-      - name: Create VMware config.ini (SECONDARY)
-        shell: pwsh
-        run: |
-          $dir = "$env:APPDATA\VMware"
-          if (!(Test-Path $dir)) { New-Item $dir -ItemType Directory -Force }
-          New-Item "$dir\config.ini" -ItemType File -Force
-          icacls "$dir" /grant "$env:RDP_USER:(OI)(CI)F" /T
-          Write-Host "✅ VMware config.ini created (SECONDARY)"
 
       - name: Download storage to Desktop\persistent (SECONDARY)
         shell: pwsh
         run: |
-          $dst = "$env:USERPROFILE\Desktop\persistent"
+          $dst = "C:\Users\runneradmin\Desktop\persistent"
           if (!(Test-Path $dst)) { New-Item $dst -ItemType Directory -Force }
           rclone copy gdrive:/storage $dst --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --retries 3 --timeout 10m --verbose
-          Write-Host "✅ Storage downloaded (SECONDARY)"
 
       - name: Grant persistent folder permissions (SECONDARY)
         shell: pwsh
+        continue-on-error: true
         run: |
-          icacls "$env:USERPROFILE\Desktop\persistent" /grant "$env:RDP_USER:(OI)(CI)F" /T
-          Write-Host "✅ Permissions set (SECONDARY)"
+          $folder = "C:\Users\runneradmin\Desktop\persistent"
+          $user = "$env:COMPUTERNAME\$env:RDP_USER"
+          Write-Host "Granting permissions to $user on $folder"
+          icacls $folder /grant "$user:(OI)(CI)F" /T
+
+      - name: Install VMware Workstation from cloned EXE (SECONDARY)
+        shell: pwsh
+        run: |
+          $exePath = "C:\Users\runneradmin\Desktop\persistent\VMware-workstation-full-17.6.4-24832109.exe"
+          if (Test-Path $exePath) {
+            Start-Process -FilePath $exePath `
+                          -ArgumentList '/S','/v"/qn ADDLOCAL=All"' `
+                          -Wait `
+                          -NoNewWindow `
+                          -Verb RunAs
+          } else {
+            Write-Warning "VMware installer not found at $exePath"
+          }
 
       - name: Wait until 5h30m for main workflow start (SECONDARY)
         shell: pwsh
         run: |
-          Write-Host "⏳ SECONDARY: Waiting 5h30m before starting main workflow..."
           Start-Sleep -Seconds 19800
 
       - name: Trigger main workflow (30m left) (SECONDARY)
@@ -156,20 +153,17 @@ jobs:
               ref: 'main',
               inputs: { triggered_by: 'main2', loop_id: 'secondary' }
             })
-            console.log('✅ Main workflow triggered with 30m left (from SECONDARY)')
 
       - name: Wait remaining 30m then sync (SECONDARY)
         shell: pwsh
         run: |
-          Write-Host "⏳ SECONDARY: Waiting final 30m before sync..."
           Start-Sleep -Seconds 1800
 
       - name: Run final bi-directional sync (SECONDARY)
         shell: pwsh
         run: |
-          $loc = "$env:USERPROFILE\Desktop\persistent"
+          $loc = "C:\Users\runneradmin\Desktop\persistent"
           rclone bisync $loc gdrive:/storage --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --resync --resilient --create-empty-src-dirs --retries 3 --timeout 15m --verbose
-          Write-Host "✅ Final sync complete (SECONDARY)"
 
       - name: Session complete summary (SECONDARY)
         shell: pwsh
@@ -180,3 +174,4 @@ jobs:
           Write-Host "✅ Final sync done at $(Get-Date)"
           Write-Host "🔄 Main workflow will handle next cycle"
           Write-Host "==============================="
+          
