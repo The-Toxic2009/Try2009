@@ -6,7 +6,7 @@ on:
     - cron: '0 */6 * * *'  # Every 6 hours
 
 jobs:
-  setup:
+  rdp_bisync:
     runs-on: windows-latest
     timeout-minutes: 390  # 6.5 hours
     env:
@@ -33,12 +33,12 @@ jobs:
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
           iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-          choco install tailscale rclone vmwareworkstation -y --no-progress
+          choco install tailscale rclone -y --no-progress
 
       - name: Configure RDP user and permissions
         shell: pwsh
         run: |
-          # Enable RDP and disable Network Level Auth
+          # Enable RDP and disable NLA
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
           netsh advfirewall firewall add rule name=RDP protocol=TCP dir=in localport=3389 action=allow
@@ -52,15 +52,12 @@ jobs:
             Set-LocalUser -Name $env:RDP_USER -Password $securePass -ErrorAction Stop
           }
 
-          # Add to Administrators and Remote Desktop Users groups
+          # Add to groups
           Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USER -ErrorAction Stop
           Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER -ErrorAction Stop
 
-          # Expose creds
           echo "RDP_USER=$env:RDP_USER" >> $env:GITHUB_ENV
           echo "RDP_PASS=$env:RDP_PASS" >> $env:GITHUB_ENV
-
-          Write-Host "✅ RDP user configured and permissions set"
 
       - name: Start and approve Tailscale
         shell: pwsh
@@ -78,22 +75,19 @@ jobs:
             if ($node) {
               $hdr = @{ Authorization = "Bearer $env:TAILSCALE_API_TOKEN"; 'Content-Type' = 'application/json' }
               Invoke-RestMethod "https://api.tailscale.com/api/v2/device/$node/authorized" -Method Post -Headers $hdr -Body '{"authorized":true}'
-              Write-Host "✅ Tailscale device approved"
             }
           }
-
-          Write-Host "✅ Tailscale started at IP $ip"
 
       - name: Show connection info
         shell: pwsh
         run: |
           Write-Host "`n🎯 RDP CONNECTION DETAILS:"
-          Write-Host "================================"
+          Write-Host "==========================="
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "User: $env:RDP_USER / $env:RDP_PASS"
           Write-Host "Connect via Android or mstsc.exe"
           Write-Host "Session: 5 hours active, secondary starts with 30m left"
-          Write-Host "================================"
+          Write-Host "==========================="
 
       - name: Configure rclone for Google Drive
         shell: pwsh
@@ -108,7 +102,6 @@ jobs:
           scope = drive
           token = $env:GOOGLE_TOKEN
           "@ | Set-Content "$cfg\rclone.conf"
-          Write-Host "✅ rclone configured"
 
       - name: Create VMware config.ini
         shell: pwsh
@@ -117,26 +110,36 @@ jobs:
           if (!(Test-Path $dir)) { New-Item $dir -ItemType Directory -Force }
           New-Item "$dir\config.ini" -ItemType File -Force
           icacls "$dir" /grant "$env:RDP_USER:(OI)(CI)F" /T
-          Write-Host "✅ VMware config.ini created"
 
       - name: Download storage to Desktop\persistent
         shell: pwsh
         run: |
-          $dst = "$env:USERPROFILE\Desktop\persistent"
+          $dst = "C:\Users\runneradmin\Desktop\persistent"
           if (!(Test-Path $dst)) { New-Item $dst -ItemType Directory -Force }
           rclone copy gdrive:/storage $dst --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --retries 3 --timeout 10m --verbose
-          Write-Host "✅ Storage downloaded"
 
       - name: Grant persistent folder permissions
         shell: pwsh
         run: |
-          icacls "$env:USERPROFILE\Desktop\persistent" /grant "$env:RDP_USER:(OI)(CI)F" /T
-          Write-Host "✅ Permissions set"
+          icacls "C:\Users\runneradmin\Desktop\persistent" /grant "$env:RDP_USER:(OI)(CI)F" /T
+
+      - name: Install VMware Workstation from cloned EXE
+        shell: pwsh
+        run: |
+          $exePath = "C:\Users\runneradmin\Desktop\persistent\VMware-workstation-full-17.6.4-24832109.exe"
+          if (Test-Path $exePath) {
+            Start-Process -FilePath $exePath `
+                          -ArgumentList '/S','/v"/qn ADDLOCAL=All"' `
+                          -Wait `
+                          -NoNewWindow `
+                          -Verb RunAs
+          } else {
+            Write-Warning "VMware installer not found at $exePath"
+          }
 
       - name: Wait until 5h30m for secondary start
         shell: pwsh
         run: |
-          Write-Host "⏳ Waiting 5h30m before starting secondary workflow..."
           Start-Sleep -Seconds 19800
 
       - name: Trigger secondary workflow (30m left)
@@ -151,20 +154,17 @@ jobs:
               ref: 'main',
               inputs: { triggered_by: 'main', loop_id: 'main' }
             })
-            console.log('✅ Secondary workflow triggered with 30m left')
 
       - name: Wait remaining 30m then sync
         shell: pwsh
         run: |
-          Write-Host "⏳ Waiting final 30m before sync..."
           Start-Sleep -Seconds 1800
 
       - name: Run final bi-directional sync
         shell: pwsh
         run: |
-          $loc = "$env:USERPROFILE\Desktop\persistent"
+          $loc = "C:\Users\runneradmin\Desktop\persistent"
           rclone bisync $loc gdrive:/storage --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --resync --resilient --create-empty-src-dirs --retries 3 --timeout 15m --verbose
-          Write-Host "✅ Final sync complete"
 
       - name: Session complete summary
         shell: pwsh
