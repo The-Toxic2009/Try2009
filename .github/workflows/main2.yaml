@@ -9,7 +9,7 @@ on:
       loop_id:
         required: true
   schedule:
-    - cron: '30 2,7,12,17,22 * * *'  # 2:30 AM/7:30AM/12:30PM/5:30PM/10:30PM (offset 2.5h)
+    - cron: '30 2,7,12,17,22 * * *'  # Adjust if you want a fallback CRON, or remove
 
 jobs:
   rdp_bisync_secondary:
@@ -64,6 +64,20 @@ jobs:
           echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
           Write-Host "✅ Tailscale connected: $ip"
 
+      - name: Configure rclone for Google Drive
+        shell: pwsh
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
+        run: |
+          $configDir = "$env:USERPROFILE\.config\rclone"
+          if (!(Test-Path $configDir)) { New-Item -ItemType Directory -Path $configDir -Force }
+          $configContent = "[gdrive]`ntype = drive`nclient_id = $env:GOOGLE_CLIENT_ID`nclient_secret = $env:GOOGLE_CLIENT_SECRET`nscope = drive`ntoken = $env:GOOGLE_TOKEN"
+          $configPath = "$configDir\rclone.conf"
+          $configContent | Set-Content -Path $configPath -Encoding UTF8
+          Write-Host "✅ rclone configured"
+
       - name: Download storage folder to Desktop\persistent (with abuse bypass)
         shell: pwsh
         run: |
@@ -84,31 +98,39 @@ jobs:
         run: |
           $local = "$env:USERPROFILE\Desktop\persistent"
           $remote = "gdrive:/storage"
-          
+
           Write-Host "🔄 Starting initial resync..."
           rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --resync --verbose
 
-          for ($i=0; $i -lt 9; $i++) {
+          try {
+            for ($i=0; $i -lt 9; $i++) {
               Write-Host "🔄 Starting 30-minute bisync cycle..."
               rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
               Write-Host "✅ Bi-directional sync complete. Sleeping for 30 minutes..."
               Start-Sleep -Seconds 1800
+            }
+          }
+          finally {
+            Write-Host "🔄 Final sync before session ends..."
+            rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
+            Write-Host "✅ Final sync complete"
           }
 
-          Write-Host "🔄 Final sync before session ends..."
-          rclone bisync $local $remote --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --verbose
-          Write-Host "✅ Final sync complete"
-
-      - name: Trigger main workflow
-        uses: peter-evans/workflow-dispatch@v1
+      - name: Trigger main workflow using API
+        uses: actions/github-script@v7
         with:
-          token: ${{ secrets.PAT_TOKEN }}
-          repository: ${{ github.repository }}
-          workflow: main.yaml
-          ref: main
-          inputs: |
-            triggered_by: main2
-            loop_id: secondary
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'main.yaml',
+              ref: 'main',
+              inputs: {
+                triggered_by: 'main2',
+                loop_id: 'secondary'
+              }
+            })
 
       - name: Show connection info
         shell: pwsh
