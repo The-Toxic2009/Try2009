@@ -3,12 +3,12 @@ name: RDP-and-Drive-BiSync-Main-Automated
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '0 */6 * * *'  # ONLY main is scheduled, every 6 hours
 
 jobs:
   rdp_bisync:
     runs-on: windows-latest
-    timeout-minutes: 390  # 6.5 hours
+    timeout-minutes: 360  # 6 hours hard stop for GitHub Actions Windows runners
     env:
       RDP_USER: 'RDP'
       RDP_PASS: ${{ secrets.RDP_PASS }}
@@ -83,7 +83,7 @@ jobs:
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "User: $env:RDP_USER / $env:RDP_PASS"
           Write-Host "Connect via Android or mstsc.exe"
-          Write-Host "Session: 5 hours active, secondary starts with 30m left"
+          Write-Host "Session: 5h 45m active, secondary starts at 5h 45m"
           Write-Host "==========================="
 
       - name: Configure rclone for Google Drive
@@ -118,23 +118,23 @@ jobs:
 
       - name: Install VMware Workstation from cloned EXE
         shell: pwsh
-        continue-on-error: true
         run: |
-         $exePath = "C:\Users\runneradmin\Desktop\persistent\VMware-workstation-full-17.6.4-24832109.exe"
-         if (Test-Path $exePath) {
-         Write-Host "Installing VMware from $exePath"
-         Start-Process -FilePath $exePath -ArgumentList '/S','/v"/qn ADDLOCAL=All"' -Wait
-         } else {
-         Write-Warning "VMware installer not found at $exePath"
-         }
-    
+          $exePath = "C:\Users\runneradmin\Desktop\persistent\VMware-workstation-full-17.6.4-24832109.exe"
+          if (Test-Path $exePath) {
+            Write-Host "Installing VMware from $exePath"
+            Start-Process -FilePath $exePath -ArgumentList '/S', '/v"/qn ADDLOCAL=All"' -Wait
+          } else {
+            Write-Warning "VMware installer not found at $exePath"
+          }
 
-      - name: Wait until 5h30m for secondary start
+      # === SCHEDULING TRICK ===
+      - name: Wait until 5h45m (so secondary has 15m before main ends)
         shell: pwsh
         run: |
-          Start-Sleep -Seconds 19800
+          Write-Host "⏳ Waiting 5h45m before starting secondary workflow..."
+          Start-Sleep -Seconds 20700  # 5 hours 45 minutes
 
-      - name: Trigger secondary workflow (30m left)
+      - name: Trigger secondary workflow (main2.yaml, hand-off)
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
@@ -147,10 +147,11 @@ jobs:
               inputs: { triggered_by: 'main', loop_id: 'main' }
             })
 
-      - name: Wait remaining 30m then sync
+      - name: Wait remaining 15m then sync
         shell: pwsh
         run: |
-          Start-Sleep -Seconds 1800
+          Write-Host "⏳ Waiting final 15m before sync..."
+          Start-Sleep -Seconds 900
 
       - name: Run final bi-directional sync
         shell: pwsh
@@ -163,7 +164,7 @@ jobs:
         run: |
           Write-Host "`n🎯 MAIN SESSION COMPLETE:"
           Write-Host "---------------------------"
-          Write-Host "🔄 Secondary started with 30m remaining"
+          Write-Host "🔄 Secondary started at 5h45m"
           Write-Host "✅ Final sync done at $(Get-Date)"
           Write-Host "🔄 Secondary workflow will handle next cycle"
           Write-Host "==============================="
