@@ -1,0 +1,441 @@
+name: RDP-and-Drive-BiSync-Main-Continuous
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours - ONLY main workflow has schedule
+
+jobs:
+  rdp_bisync_main:
+    runs-on: windows-latest
+    timeout-minutes: 360  # Exactly 6 hours
+    env:
+      LOOP_ID: main
+      RDP_USER: 'RDPUser'
+      RDP_PASS: ${{ secrets.RDP_PASS }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Chocolatey packages
+        uses: actions/cache@v4
+        with:
+          path: C:\ProgramData\chocolatey\lib
+          key: ${{ runner.os }}-choco-main-${{ hashFiles('**/*.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-choco-main-
+
+      - name: Install Chocolatey and Essential Tools
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          try {
+            iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+            Write-Host "✅ Chocolatey installed successfully"
+          } catch {
+            Write-Host "❌ Chocolatey installation failed: $($_.Exception.Message)"
+          }
+          
+          # Install essential tools
+          $tools = @('tailscale', 'rclone', 'git', '7zip', 'notepadplusplus', 'vscode', 'firefox', 'googlechrome')
+          foreach ($tool in $tools) {
+            try {
+              choco install $tool -y --no-progress --force
+              Write-Host "✅ $tool installed successfully"
+            } catch {
+              Write-Host "⚠️ $tool installation failed: $($_.Exception.Message)"
+            }
+          }
+
+      - name: Configure RDP with Enhanced Security
+        shell: pwsh
+        run: |
+          try {
+            # Enable RDP
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+            
+            # Configure firewall
+            netsh advfirewall firewall add rule name="RDP-In" protocol=TCP dir=in localport=3389 action=allow profile=any
+            
+            # Restart Terminal Services
+            Restart-Service TermService -Force
+            Write-Host "✅ RDP services configured"
+
+            # Create RDP user with retry logic
+            $securePass = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+            $maxRetries = 3
+            $retryCount = 0
+            
+            do {
+              try {
+                if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+                  Set-LocalUser -Name $env:RDP_USER -Password $securePass -PasswordNeverExpires $true -ErrorAction Stop
+                  Write-Host "✅ Updated existing user: $env:RDP_USER"
+                } else {
+                  New-LocalUser -Name $env:RDP_USER -Password $securePass -FullName 'RDP User' -Description 'Remote Desktop User' -PasswordNeverExpires $true -UserMayNotChangePassword $true -ErrorAction Stop
+                  Write-Host "✅ Created new user: $env:RDP_USER"
+                }
+                
+                # Add to groups with error handling
+                try { Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USER -ErrorAction SilentlyContinue } catch { }
+                try { Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER -ErrorAction SilentlyContinue } catch { }
+                
+                Write-Host "✅ User groups configured"
+                break
+              } catch {
+                $retryCount++
+                Write-Host "⚠️ User creation attempt $retryCount failed: $($_.Exception.Message)"
+                Start-Sleep -Seconds 2
+              }
+            } while ($retryCount -lt $maxRetries)
+
+            echo "RDP_USER=$env:RDP_USER" >> $env:GITHUB_ENV
+          } catch {
+            Write-Host "❌ RDP configuration failed: $($_.Exception.Message)"
+            throw
+          }
+
+      - name: Setup Tailscale Connection
+        shell: pwsh
+        run: |
+          try {
+            $hostname = "gh-rdp-main-$env:GITHUB_RUN_ID-$(Get-Date -Format 'MMddHHmm')"
+            
+            & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --accept-routes --accept-dns
+            
+            # Wait for IP with timeout
+            $timeout = 60
+            $elapsed = 0
+            $ip = $null
+            
+            while ($elapsed -lt $timeout -and !$ip) {
+              Start-Sleep -Seconds 3
+              $elapsed += 3
+              try {
+                $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                if ($ip) { break }
+              } catch { }
+            }
+            
+            if ($ip) {
+              echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+              Write-Host "✅ Tailscale connected: $ip"
+              
+              # Auto-approve node if API token available
+              if ($env:TAILSCALE_API_TOKEN) {
+                try {
+                  $nodeInfo = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+                  $nodeId = $nodeInfo.Self.ID
+                  if ($nodeId) {
+                    $headers = @{ Authorization = "Bearer $env:TAILSCALE_API_TOKEN"; 'Content-Type' = 'application/json' }
+                    Invoke-RestMethod "https://api.tailscale.com/api/v2/device/$nodeId/authorized" -Method Post -Headers $headers -Body '{"authorized":true}' -ErrorAction SilentlyContinue
+                    Write-Host "✅ Node auto-approved"
+                  }
+                } catch {
+                  Write-Host "⚠️ Auto-approval failed (manual approval may be needed)"
+                }
+              }
+            } else {
+              throw "Failed to get Tailscale IP after $timeout seconds"
+            }
+          } catch {
+            Write-Host "❌ Tailscale setup failed: $($_.Exception.Message)"
+            throw
+          }
+
+      - name: Display Connection Information
+        shell: pwsh
+        run: |
+          Write-Host "`n" -ForegroundColor Green
+          Write-Host "🎯 RDP CONNECTION DETAILS (MAIN WORKFLOW)" -ForegroundColor Green
+          Write-Host "==========================================" -ForegroundColor Green
+          Write-Host "🌐 Tailscale IP: $env:TAILSCALE_IP" -ForegroundColor Yellow
+          Write-Host "👤 Username: $env:RDP_USER" -ForegroundColor Yellow  
+          Write-Host "🔐 Password: $env:RDP_PASS" -ForegroundColor Yellow
+          Write-Host "⏰ Active Time: 5 hours 50 minutes" -ForegroundColor Cyan
+          Write-Host "🔄 Sync starts: 5 hours 30 minutes" -ForegroundColor Cyan
+          Write-Host "🔀 Secondary starts: 5 hours 50 minutes" -ForegroundColor Cyan
+          Write-Host "📱 Connect using RDP client (Android/Windows)" -ForegroundColor White
+          Write-Host "==========================================" -ForegroundColor Green
+          Write-Host "`n" -ForegroundColor Green
+
+      - name: Configure rclone for Google Drive
+        shell: pwsh
+        run: |
+          try {
+            $configDir = "$env:USERPROFILE\.config\rclone"
+            if (!(Test-Path $configDir)) { 
+              New-Item $configDir -ItemType Directory -Force | Out-Null
+            }
+            
+            $configContent = @"
+[gdrive]
+type = drive
+client_id = $env:GOOGLE_CLIENT_ID
+client_secret = $env:GOOGLE_CLIENT_SECRET
+scope = drive
+token = $env:GOOGLE_TOKEN
+team_drive = 
+"@
+            $configContent | Set-Content "$configDir\rclone.conf" -Encoding UTF8
+            Write-Host "✅ rclone configuration created"
+          } catch {
+            Write-Host "❌ rclone configuration failed: $($_.Exception.Message)"
+            throw
+          }
+
+      - name: Setup Persistent Directory and Download Files
+        shell: pwsh
+        run: |
+          try {
+            $persistentDir = "C:\Users\runneradmin\Desktop\persistent"
+            if (!(Test-Path $persistentDir)) { 
+              New-Item $persistentDir -ItemType Directory -Force | Out-Null
+            }
+            
+            Write-Host "📥 Downloading files from Google Drive..."
+            rclone copy gdrive:/storage $persistentDir --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --retries 3 --timeout 15m --progress --transfers 4
+            
+            Write-Host "✅ Files downloaded to persistent directory"
+            
+            # Create desktop shortcuts for easy access
+            $shell = New-Object -ComObject WScript.Shell
+            
+            # Shortcut to persistent folder
+            $shortcut = $shell.CreateShortcut("C:\Users\runneradmin\Desktop\Persistent Folder.lnk")
+            $shortcut.TargetPath = $persistentDir
+            $shortcut.Description = "Persistent storage synchronized with Google Drive"
+            $shortcut.Save()
+            
+            Write-Host "✅ Desktop shortcuts created"
+          } catch {
+            Write-Host "❌ Persistent directory setup failed: $($_.Exception.Message)"
+          }
+
+      - name: Set Persistent Directory Permissions
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            $folder = "C:\Users\runneradmin\Desktop\persistent"
+            $user = $env:RDP_USER
+            
+            # Wait for user creation to complete
+            Start-Sleep -Seconds 5
+            
+            # Grant permissions using icacls with retry
+            $maxRetries = 3
+            $retryCount = 0
+            
+            do {
+              try {
+                $result = icacls $folder /grant "$($env:COMPUTERNAME)\$user:(OI)(CI)F" /T
+                if ($LASTEXITCODE -eq 0) {
+                  Write-Host "✅ Permissions granted to $user on $folder"
+                  break
+                } else {
+                  throw "icacls returned exit code $LASTEXITCODE"
+                }
+              } catch {
+                $retryCount++
+                Write-Host "⚠️ Permission attempt $retryCount failed: $($_.Exception.Message)"
+                if ($retryCount -lt $maxRetries) {
+                  Start-Sleep -Seconds 3
+                }
+              }
+            } while ($retryCount -lt $maxRetries)
+            
+            # Alternative method using PowerShell ACL
+            try {
+              $acl = Get-Acl $folder
+              $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule("$env:COMPUTERNAME\$user", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+              $acl.SetAccessRule($accessRule)
+              $acl | Set-Acl $folder
+              Write-Host "✅ ACL permissions set as backup method"
+            } catch {
+              Write-Host "⚠️ ACL backup method failed: $($_.Exception.Message)"
+            }
+            
+          } catch {
+            Write-Host "❌ Permission setting failed: $($_.Exception.Message)"
+          }
+
+      - name: Install VMware Workstation Pro
+        shell: pwsh
+        run: |
+          try {
+            $vmwareExe = "C:\Users\runneradmin\Desktop\persistent\VMware-workstation-full-17.6.4-24832109.exe"
+            
+            if (Test-Path $vmwareExe) {
+              Write-Host "📦 Installing VMware Workstation Pro..."
+              
+              # Correct silent install parameters for VMware Workstation
+              $arguments = @(
+                '/S',                    # Silent install
+                '/v"/qn',               # MSI quiet mode  
+                'EULAS_AGREED=1',       # Accept EULA
+                'AUTOSOFTWAREUPDATE=0', # Disable auto updates
+                'DATACOLLECTION=0',     # Disable data collection
+                'ADDLOCAL=ALL',         # Install all components
+                'REBOOT=ReallySuppress"' # Suppress reboot
+              )
+              
+              $process = Start-Process -FilePath $vmwareExe -ArgumentList $arguments -Wait -PassThru -NoNewWindow
+              
+              if ($process.ExitCode -eq 0) {
+                Write-Host "✅ VMware Workstation Pro installed successfully"
+              } else {
+                Write-Host "⚠️ VMware installation completed with exit code: $($process.ExitCode)"
+              }
+              
+              # Verify installation
+              $vmwareInstallPath = "C:\Program Files (x86)\VMware\VMware Workstation\vmware.exe"
+              if (Test-Path $vmwareInstallPath) {
+                Write-Host "✅ VMware Workstation Pro installation verified"
+              }
+              
+            } else {
+              Write-Host "⚠️ VMware installer not found at $vmwareExe"
+              Write-Host "ℹ️  Please ensure the installer is uploaded to Google Drive storage folder"
+            }
+          } catch {
+            Write-Host "❌ VMware installation failed: $($_.Exception.Message)"
+          }
+
+      - name: Install Additional Ethical Hacking Tools
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "🔧 Installing additional tools for educational purposes..."
+          
+          # Install via Chocolatey (if not already installed)
+          $additionalTools = @(
+            'nmap',
+            'wireshark', 
+            'putty',
+            'winscp',
+            'burp-suite-free-edition',
+            'postman',
+            'docker-desktop',
+            'virtualbox',
+            'python3',
+            'nodejs'
+          )
+          
+          foreach ($tool in $additionalTools) {
+            try {
+              choco install $tool -y --no-progress --ignore-checksums --force
+              Write-Host "✅ $tool installed"
+            } catch {
+              Write-Host "⚠️ $tool installation failed"
+            }
+          }
+          
+          # Install Python packages for security tools
+          try {
+            pip install requests beautifulsoup4 scapy netaddr
+            Write-Host "✅ Python security packages installed"
+          } catch {
+            Write-Host "⚠️ Python packages installation failed"
+          }
+
+      # Main active period - wait until 5.5 hours (19800 seconds)
+      - name: Active RDP Session (5 hours 30 minutes)
+        shell: pwsh
+        run: |
+          Write-Host "🟢 RDP session is now active for 5 hours 30 minutes..."
+          Write-Host "📱 You can now connect using the details shown above"
+          Write-Host "⏰ Sync will start automatically in 5 hours 30 minutes"
+          Write-Host "🔄 Secondary workflow will start in 5 hours 50 minutes"
+          Write-Host ""
+          Write-Host "🛠️  Available tools installed:"
+          Write-Host "   - VMware Workstation Pro (if installer was available)"
+          Write-Host "   - Visual Studio Code"
+          Write-Host "   - Git"
+          Write-Host "   - Chrome & Firefox browsers" 
+          Write-Host "   - Network tools (nmap, wireshark)"
+          Write-Host "   - Development tools (Python, Node.js)"
+          Write-Host "   - And more security/development tools"
+          Write-Host ""
+          
+          Start-Sleep -Seconds 19800  # 5.5 hours
+
+      - name: Pre-sync Preparation
+        shell: pwsh
+        run: |
+          Write-Host "🔄 Starting sync preparation (30 minutes remaining)..."
+          
+          # Final sync from persistent directory
+          try {
+            $persistentDir = "C:\Users\runneradmin\Desktop\persistent"
+            Write-Host "📤 Syncing local changes to Google Drive..."
+            
+            rclone bisync $persistentDir gdrive:/storage --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --resync --resilient --create-empty-src-dirs --retries 5 --timeout 20m --progress --transfers 4 --checkers 8
+            
+            Write-Host "✅ Sync completed successfully"
+          } catch {
+            Write-Host "❌ Sync failed: $($_.Exception.Message)"
+          }
+
+      # Wait until 5 hours 50 minutes (21000 seconds total) to trigger secondary
+      - name: Wait for Secondary Workflow Trigger Time
+        shell: pwsh
+        run: |
+          Write-Host "⏳ Waiting until 5 hours 50 minutes to trigger secondary workflow..."
+          Start-Sleep -Seconds 1200  # 20 minutes (from 5:30 to 5:50)
+
+      - name: Trigger Secondary Workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            console.log('🚀 Triggering secondary workflow...');
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'main2.yaml',
+                ref: 'main',
+                inputs: { 
+                  triggered_by: 'main', 
+                  loop_id: context.runId.toString(),
+                  timestamp: new Date().toISOString()
+                }
+              });
+              console.log('✅ Secondary workflow triggered successfully');
+            } catch (error) {
+              console.error('❌ Failed to trigger secondary workflow:', error.message);
+              throw error;
+            }
+
+      - name: Final Handoff Period
+        shell: pwsh
+        run: |
+          Write-Host "🔄 Final 10-minute handoff period..."
+          Write-Host "🟢 Secondary workflow should be starting now"
+          Write-Host "📊 Session summary:"
+          Write-Host "   - Total runtime: 6 hours"
+          Write-Host "   - Active RDP time: 5 hours 50 minutes"
+          Write-Host "   - Sync completed: $(Get-Date)"
+          Write-Host "   - Secondary workflow: Started"
+          Write-Host "✅ Main workflow completing successfully"
+          
+          Start-Sleep -Seconds 600  # Final 10 minutes
+
+      - name: Main Workflow Complete
+        shell: pwsh
+        run: |
+          Write-Host "`n🎯 MAIN WORKFLOW COMPLETE" -ForegroundColor Green
+          Write-Host "=============================" -ForegroundColor Green
+          Write-Host "⏰ Completed at: $(Get-Date)" -ForegroundColor Yellow
+          Write-Host "🔄 Secondary workflow: Active" -ForegroundColor Yellow
+          Write-Host "💾 Data: Synced to Google Drive" -ForegroundColor Yellow
+          Write-Host "🔄 Next cycle: Will start automatically" -ForegroundColor Yellow
+          Write-Host "=============================" -ForegroundColor Green
