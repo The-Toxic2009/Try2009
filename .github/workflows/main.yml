@@ -134,19 +134,20 @@ jobs:
       - name: Configure rclone for Google Drive with optimizations
         shell: pwsh
         run: |
-          $cfg = "$env:USERPROFILE\.config\rclone"
-          if (!(Test-Path $cfg)) { New-Item $cfg -ItemType Directory -Force | Out-Null }
-          
-          $configContent = @"
-[gdrive]
-type = drive
-client_id = $env:GOOGLE_CLIENT_ID
-client_secret = $env:GOOGLE_CLIENT_SECRET
-scope = drive
-token = $env:GOOGLE_TOKEN
-chunk_size = 256M
-upload_cutoff = 256M
-"@
+         $cfg = "$env:USERPROFILE\.config\rclone"
+         if (!(Test-Path $cfg)) { New-Item $cfg -ItemType Directory -Force }
+
+         $configContent = @"
+         [gdrive]
+         type = drive
+         client_id = $env:GOOGLE_CLIENT_ID
+         client_secret = $env:GOOGLE_CLIENT_SECRET
+         scope = drive
+         token = $env:GOOGLE_TOKEN
+         chunk_size = 256M
+         upload_cutoff = 256M
+         "@
+
           $configContent | Set-Content "$cfg\rclone.conf" -Encoding UTF8
           Write-Host "✅ rclone configured with optimizations"
 
