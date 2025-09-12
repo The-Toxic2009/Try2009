@@ -1,0 +1,218 @@
+name: RDP-and-Drive-BiSync-Secondary
+
+on:
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        required: true
+      loop_id:
+        required: true
+
+jobs:
+  rdp_bisync_secondary:
+    runs-on: windows-latest
+    timeout-minutes: 360  # 6 hours for sync window
+    env:
+      LOOP_ID: secondary
+      RDP_USER: 'RDP'
+      RDP_PASS: ${{ secrets.RDP_PASS }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Chocolatey packages
+        uses: actions/cache@v4
+        with:
+          path: C:\ProgramData\chocolatey\lib
+          key: ${{ runner.os }}-choco-secondary-${{ hashFiles('**/*.yml') }}
+
+      - name: Install Chocolatey, Tailscale, and rclone
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          choco install tailscale rclone -y --no-progress --force
+
+      - name: Configure RDP user and permissions
+        shell: pwsh
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-In" protocol=TCP dir=in localport=3389 action=allow profile=any
+          Restart-Service TermService -Force
+
+          # Create or update RDP user
+          $securePass = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $env:RDP_USER -Password $securePass -FullName 'Remote User' -ErrorAction Stop
+          } else {
+            Set-LocalUser -Name $env:RDP_USER -Password $securePass -ErrorAction Stop
+          }
+          Add-LocalGroupMember -Group Administrators -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER -ErrorAction SilentlyContinue
+
+          echo "RDP_USER=$env:RDP_USER" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$env:RDP_PASS" >> $env:GITHUB_ENV
+
+      - name: Start and approve Tailscale
+        shell: pwsh
+        run: |
+          $hostname = "gh-rdp-secondary-$env:GITHUB_RUN_ID"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --accept-routes --accept-dns
+
+          # Wait for IP
+          for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Seconds 3
+            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            if ($ip) { break }
+          }
+          if (-not $ip) { throw "Failed to get Tailscale IP" }
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          if ($env:TAILSCALE_API_TOKEN) {
+            try {
+              $node = (& "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json).Self.ID
+              if ($node) {
+                $hdr = @{ Authorization = "Bearer $env:TAILSCALE_API_TOKEN"; 'Content-Type' = 'application/json' }
+                Invoke-RestMethod "https://api.tailscale.com/api/v2/device/$node/authorized" -Method Post -Headers $hdr -Body '{"authorized":true}' -ErrorAction SilentlyContinue
+              }
+            } catch {}
+          }
+
+      - name: Show connection info
+        shell: pwsh
+        run: |
+          Write-Host "`n🎯 RDP CONNECTION DETAILS (SECONDARY):" -ForegroundColor Green
+          Write-Host "=======================================" -ForegroundColor Green
+          Write-Host "🌐 Tailscale IP: $env:TAILSCALE_IP" -ForegroundColor Yellow
+          Write-Host "👤 User: $env:RDP_USER" -ForegroundColor Yellow
+          Write-Host "🔐 Pass: $env:RDP_PASS" -ForegroundColor Yellow
+          Write-Host "⏰ Active: 5h30m, Next main starts at 5h50m" -ForegroundColor Cyan
+          Write-Host "📱 Connect via Android RDP or mstsc.exe" -ForegroundColor White
+          Write-Host "=======================================" -ForegroundColor Green
+
+      - name: Configure rclone for Google Drive with optimizations
+        shell: pwsh
+        run: |
+          $cfg = "$env:USERPROFILE\.config\rclone"
+          if (!(Test-Path $cfg)) { New-Item $cfg -ItemType Directory -Force }
+
+          $configContent = @"
+          [gdrive]
+          type = drive
+          client_id = $env:GOOGLE_CLIENT_ID
+          client_secret = $env:GOOGLE_CLIENT_SECRET
+          scope = drive
+          token = $env:GOOGLE_TOKEN
+          chunk_size = 256M
+          upload_cutoff = 256M
+          "@
+
+          $configContent | Set-Content "$cfg\rclone.conf" -Encoding UTF8
+          Write-Host "✅ rclone configured with optimizations"
+
+      - name: Download storage to Desktop\persistent
+        shell: pwsh
+        run: |
+          $dst = "C:\Users\runneradmin\Desktop\persistent"
+          if (!(Test-Path $dst)) { New-Item $dst -ItemType Directory -Force }
+          rclone copy gdrive:/storage $dst --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --transfers 8 --checkers 16 --buffer-size 32M --drive-chunk-size 256M --fast-list --retries 3 --timeout 15m --progress
+          Write-Host "✅ Files downloaded"
+
+      - name: Grant persistent folder permissions
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $folder = "C:\Users\runneradmin\Desktop\persistent"
+          $user = "$env:COMPUTERNAME\$env:RDP_USER"
+          Start-Sleep -Seconds 3
+          try {
+            icacls $folder /grant "$user:(OI)(CI)F" /T
+            Write-Host "✅ Permissions granted via icacls"
+          } catch {
+            try {
+              $acl = Get-Acl $folder
+              $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($user, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+              $acl.SetAccessRule($rule)
+              $acl | Set-Acl $folder
+              Write-Host "✅ Permissions granted via PowerShell ACL"
+            } catch {
+              Write-Host "⚠️ Permission setting failed: $($_.Exception.Message)"
+            }
+          }
+
+      - name: Install VMware Workstation from persistent storage
+        shell: pwsh
+        run: |
+          $exePath = "C:\Users\runneradmin\Desktop\persistent\VMware-workstation-full-17.6.4-24832109.exe"
+          if (Test-Path $exePath) {
+            Write-Host "📦 Installing VMware Workstation Pro..."
+            $msiArgs = 'EULAS_AGREED=1 AUTOSOFTWAREUPDATE=0 DATACOLLECTION=0 ADDLOCAL=ALL REBOOT=ReallySuppress'
+            $installArgs = "/S /v`"/qn $msiArgs`""
+            $p = Start-Process -FilePath $exePath -ArgumentList $installArgs -Wait -PassThru -NoNewWindow
+            Write-Host "VMware exit code: $($p.ExitCode)"
+            if (Test-Path "C:\Program Files (x86)\VMware\VMware Workstation\vmware.exe") {
+              Write-Host "✅ VMware installed"
+            } else {
+              Write-Host "⚠️ VMware install may have failed"
+            }
+          } else {
+            Write-Host "⚠️ VMware installer not found"
+          }
+
+      - name: Active RDP Session - Wait 5h30m
+        shell: pwsh
+        run: |
+          Write-Host "🟢 Secondary RDP active for 5h30m…" -ForegroundColor Green
+          Start-Sleep -Seconds 19800
+
+      - name: Pre-sync preparation
+        shell: pwsh
+        run: |
+          Write-Host "🔄 Starting sync (30m remaining)..." -ForegroundColor Magenta
+          $loc = "C:\Users\runneradmin\Desktop\persistent"
+          rclone bisync $loc gdrive:/storage --config "$env:USERPROFILE\.config\rclone\rclone.conf" --drive-acknowledge-abuse --drive-skip-gdocs --resync --resilient --create-empty-src-dirs --transfers 8 --checkers 16 --buffer-size 32M --drive-chunk-size 256M --fast-list --retries 5 --timeout 25m --progress
+          Write-Host "✅ Sync completed"
+
+      - name: Wait until 5h50m to trigger next main
+        shell: pwsh
+        run: |
+          Write-Host "⏳ Waiting until 5h50m…" -ForegroundColor Yellow
+          Start-Sleep -Seconds 1200
+
+      - name: Trigger main workflow (continue cycle)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'main.yml',
+              ref: 'main',
+              inputs: { triggered_by: 'secondary', loop_id: context.runId.toString() }
+            })
+
+      - name: Final 10-minute overlap
+        shell: pwsh
+        run: |
+          Write-Host "🔄 Final 10-minute handoff…" -ForegroundColor Cyan
+          Start-Sleep -Seconds 600
+
+      - name: Secondary workflow complete
+        shell: pwsh
+        run: |
+          Write-Host "`n🎯 SECONDARY WORKFLOW COMPLETE" -ForegroundColor Green
+          Write-Host "===============================" -ForegroundColor Green
+          Write-Host "⏰ Completed: $(Get-Date)" -ForegroundColor Yellow
+          Write-Host "🔄 Next main: triggered" -ForegroundColor Yellow
+          Write-Host "💾 Data: Synced" -ForegroundColor Yellow
+          Write-Host "===============================" -ForegroundColor Green
